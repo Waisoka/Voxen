@@ -10,7 +10,7 @@ import {
   Move,
   Activity,
   Lightbulb,
-  Layers,
+  Layers, SquareDashedMousePointer,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -128,7 +128,7 @@ export function PartInspectPanel({
   if (!part && !assembly) {
     return (
       <div className="p-4 border border-border rounded-md bg-surface flex flex-col items-center justify-center text-center h-full min-h-[200px]">
-        <Info className="w-8 h-8 text-text-muted mb-2 opacity-20" />
+        <SquareDashedMousePointer className="w-8 h-8 text-text-muted mb-2 opacity-20" />
         <p className="text-text-muted text-xs uppercase tracking-widest font-bold">
           Properties
         </p>
