@@ -8,11 +8,16 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Assembly parts are required' }, { status: 400 });
     }
 
-    // Connect to your GPU server directly
-    const AI_ENGINE_URL = process.env.AI_ENGINE_URL || 'http://129.212.188.102:30000/generate';
+    // Connect to AI Engine via env var (required). See .env.example
+    const AI_ENGINE_URL = process.env.AI_ENGINE_URL;
+    if (!AI_ENGINE_URL) {
+      return NextResponse.json(
+        { error: 'AI_ENGINE_URL is not configured', code: 'CONFIG_ERROR' },
+        { status: 500 },
+      );
+    }
     // The export endpoint is on the same host but /export_step
     const exportUrl = AI_ENGINE_URL.replace('/generate', '/export_step');
-
     console.log(`Sending STEP export request to AI Engine: ${exportUrl}`);
 
     const response = await fetch(exportUrl, {

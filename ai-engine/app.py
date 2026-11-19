@@ -1,18 +1,39 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
-import gradio as gr
+import os
 import json
 import re
 import html
+import urllib.request
+import urllib.error
 
-import os
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
+import gradio as gr
 
-if os.path.isdir("./models/qwen3-8b"):
-    BASE_MODEL_PATH = "./models/qwen3-8b"
-else:
-    BASE_MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
+# ---- Environment configuration (see .env.example) ----
+AI_ENGINE_HOST = os.getenv("AI_ENGINE_HOST", "0.0.0.0") or "0.0.0.0"
+AI_ENGINE_PORT = int(os.getenv("AI_ENGINE_PORT", "8000") or "8000")
 
-FINETUNED_PATH = "./models/qwen3-8b-voxen"
+_DEFAULT_BASE_MODEL = (
+    "./models/qwen3-8b" if os.path.isdir("./models/qwen3-8b") else "Qwen/Qwen2.5-7B-Instruct"
+)
+BASE_MODEL_PATH = os.getenv("BASE_MODEL_PATH", _DEFAULT_BASE_MODEL)
+FINETUNED_PATH = os.getenv("FINETUNED_PATH", "./models/qwen3-8b-voxen")
+
+# LLM provider selection: set USE_CLOUD_AI=true to use OpenRouter,
+# leave unset/false to use the local transformers model (see .env.example).
+LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+
+USE_CLOUD_AI = os.getenv("USE_CLOUD_AI", "false").lower() == "true"
+USE_OPENROUTER = USE_CLOUD_AI
+
+if USE_OPENROUTER and not (LLM_API_BASE_URL and LLM_API_KEY):
+    raise RuntimeError(
+        "USE_CLOUD_AI=true but LLM_API_BASE_URL and/or LLM_API_KEY is not set. "
+        "Configure them in .env or set USE_CLOUD_AI=false for local model."
+    )
 
 SYSTEM_PROMPT = """You are a CAD JSON generator. Output ONLY valid JSON according to the schema. No thinking, no explanation.
 
@@ -60,28 +81,32 @@ Expected JSON structure:
 }"""
 
 print("Loading model...")
-import os
-if os.path.exists(FINETUNED_PATH):
-    print("🧠 Loading Fine-tuned LoRA Adapter from:", FINETUNED_PATH)
-    tokenizer = AutoTokenizer.from_pretrained(FINETUNED_PATH, trust_remote_code=True)
-    base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    from peft import PeftModel
-    model = PeftModel.from_pretrained(base_model, FINETUNED_PATH)
+tokenizer = None
+model = None
+
+if USE_OPENROUTER:
+    print(f"🌐 OpenRouter mode: {LLM_API_BASE_URL} (model: {LLM_MODEL})")
 else:
-    print("Loading base model...")
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-print(f"✅ Ready on {next(model.parameters()).device}")
+    if os.path.exists(FINETUNED_PATH):
+        print("🧠 Loading Fine-tuned LoRA Adapter from:", FINETUNED_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(FINETUNED_PATH, trust_remote_code=True)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_PATH,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model = PeftModel.from_pretrained(base_model, FINETUNED_PATH)
+    else:
+        print("Loading base model...")
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_PATH,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    print(f"✅ Ready on {next(model.parameters()).device}")
 
 def generate_iframe_html(json_str):
     safe_json = json_str.replace('\\', '\\\\').replace('`', '\\`').replace('$', '\\$')
@@ -479,24 +504,74 @@ def clean_json(text):
             if stack == 0: return text[start_idx:i+1]
     return text[start_idx:].strip()
 
-def generate_cad(prompt, history=None):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": f"Generate CAD JSON for: {prompt}"}]
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=2048, temperature=0.1, do_sample=True, top_p=0.9, pad_token_id=tokenizer.eos_token_id)
-    
-    raw = tokenizer.decode(outputs[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
+def _generate_via_openrouter(prompt):
+    """Call an OpenRouter-compatible chat completions API using the stdlib only."""
+    url = LLM_API_BASE_URL.rstrip("/") + "/chat/completions"
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Generate CAD JSON for: {prompt}"},
+    ]
+    payload = json.dumps(
+        {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "max_tokens": 2048,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LLM_API_KEY}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.URLError as e:
+        return "{}", f"❌ OpenRouter Error: {e}"
+    try:
+        data = json.loads(body)
+        raw = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        return "{}", f"❌ OpenRouter Parse Error: {e}"
+
     clean = clean_json(raw)
-    
     try:
         parsed = json.loads(clean)
         final_json = json.dumps(parsed, indent=2)
         status = f"✅ {parsed.get('assemblyName', 'Assembly')} created"
-    except Exception as e:
+    except Exception:
         final_json = "{}"
         status = "❌ Generation Error"
+    return final_json, status
+
+
+def generate_cad(prompt, history=None):
+    if USE_OPENROUTER:
+        final_json, status = _generate_via_openrouter(prompt)
+    else:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": f"Generate CAD JSON for: {prompt}"}]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=2048, temperature=0.1, do_sample=True, top_p=0.9, pad_token_id=tokenizer.eos_token_id)
+
+        raw = tokenizer.decode(outputs[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
+        clean = clean_json(raw)
+
+        try:
+            parsed = json.loads(clean)
+            final_json = json.dumps(parsed, indent=2)
+            status = f"✅ {parsed.get('assemblyName', 'Assembly')} created"
+        except Exception:
+            final_json = "{}"
+            status = "❌ Generation Error"
 
     # Generate new iframe html containing the json
     new_html = generate_iframe_html(final_json)
@@ -599,5 +674,5 @@ async def api_export_step(request: Request):
 app = gr.mount_gradio_app(app, demo, path="/")
 
 if __name__ == "__main__":
-    print("🚀 Starting Voxen API Server on port 30000...")
-    uvicorn.run(app, host="0.0.0.0", port=30000)
+    print(f"🚀 Starting Voxen API Server on {AI_ENGINE_HOST}:{AI_ENGINE_PORT}...")
+    uvicorn.run(app, host=AI_ENGINE_HOST, port=AI_ENGINE_PORT)

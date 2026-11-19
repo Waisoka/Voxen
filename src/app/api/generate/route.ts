@@ -9,8 +9,14 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Prompt is required', code: 'VALIDATION_ERROR' }, { status: 400 });
     }
 
-    // Connect to your GPU server directly
-    const AI_ENGINE_URL = process.env.AI_ENGINE_URL || 'http://129.212.188.102:30000/generate';
+    // Connect to AI Engine via env var (required). See .env.example
+    const AI_ENGINE_URL = process.env.AI_ENGINE_URL;
+    if (!AI_ENGINE_URL) {
+      return NextResponse.json(
+        { error: 'AI_ENGINE_URL is not configured', code: 'CONFIG_ERROR' },
+        { status: 500 },
+      );
+    }
     console.log(`Sending AI generation request to: ${AI_ENGINE_URL}`);
 
     const response = await fetch(AI_ENGINE_URL, {
